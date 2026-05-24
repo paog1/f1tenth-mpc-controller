@@ -1,0 +1,12 @@
+logs/
+log/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+build/
+install/
+
+.vscode/
+.idea/
