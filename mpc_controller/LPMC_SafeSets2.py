@@ -3,19 +3,6 @@
 LMPC for F1TENTH (ROS 2 / rclpy) — based on Rosolia & Borrelli (2019)
 "Learning How to Autonomously Race a Car: a Predictive Control Approach".
 
-What this node includes (the version we ended up with):
-- Track CSV loader: derives s/theta/kappa, reads widths (w_tr_left/right) if present
-- Frenet projection (odom -> [vx,vy,wz,epsi,s,ey])
-- Seeding for seed_laps laps: curvature feedforward + PD at constant speed
-- LMPC QP solved with OSQP:
-  * affine time-varying model (Frenet kinematics + learned local linear dynamics)
-  * per-step lateral corridor from widths (keeps buffer to walls)
-  * steering/accel rate limits (linear constraints)
-  * soft terminal safe-set constraint (slack with penalty)
-- Bucketed memory: uses ALL laps safely in real time by keeping best samples per s-bin
-- Lap quality gate: reject laps with too many solver failures or near-wall samples
-- RViz visualization: publishes predicted horizon Path + Marker line
-
 State x = [v_x, v_y, w_z, e_psi, s, e_y], input u = [delta, a].
 """
 

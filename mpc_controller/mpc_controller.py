@@ -2,11 +2,10 @@
 """
 Iterative Racing-Line Learning MPC for F1TENTH (ROS 2 / rclpy)
 
-Main changes in this version:
+Τhis version:
 - Track-centric ILC approach
 - Dynamic Curvature Calculation for velocity profile generation
 - Strict Discrete Kinematic Bicycle Model for MPC prediction
-- Lowered lateral error weights to promote natural corner cutting
 """
 
 import csv
@@ -160,6 +159,7 @@ class FrenetProjector:
         return float(s_cl), float(e_y), float(e_psi)
 
     def _segment_project(self, px: float, py: float, i0: int, i1: int):
+            """Vector-projects the car's global position onto the track segment to find lateral error and arc length."""
             tx0, ty0 = float(self.track.x[i0]), float(self.track.y[i0])
             tx1, ty1 = float(self.track.x[i1]), float(self.track.y[i1])
 
@@ -252,7 +252,6 @@ class RacingLineManager:
         """Returns the dynamic curvature of the actively learned path."""
         return float(self.track._interp_pair(self.dynamic_kappa, s_query))
 
-    # --- Core Mathematical Operations ---
     def _update_dynamic_curvature(self):
         """Calculates true geometric curvature of the current racing line."""
         line = self.active_line()
@@ -278,7 +277,6 @@ class RacingLineManager:
         denom[denom < 1e-6] = 1e-6
         kappa = (Xp * Ypp - Yp * Xpp) / np.power(denom, 1.5)
         
-        # --- FIX: Let the car see the true sharp apex ---
         self.dynamic_kappa = circ_moving_average(np.abs(kappa), self.smooth_window)
 
     def _periodic_diff_matrix(self, n: int, order: int) -> sparse.csc_matrix:
@@ -298,6 +296,7 @@ class RacingLineManager:
         return sparse.csc_matrix((data, (rows, cols)), shape=(n, n))
 
     def _minimum_curvature_qp(self, data_line: np.ndarray, prev_line: np.ndarray) -> np.ndarray:
+        """Filters the driven line through an OSQP solver to minimize curvature and ensure track-bound compliance."""
         if not self.mincurv_enable:
             return self._clip_to_walls(circ_moving_average(data_line, self.smooth_window))
 
@@ -406,6 +405,7 @@ class RacingLineManager:
         return accepted, float(self.best_lap_time)
 
     def prepare_next_candidate(self, stored_laps: int):
+        """Mutates the racing line towards the apexes using dynamic curvature and passes it through the QP for safety."""
         if stored_laps < max(2, self.seed_laps):
             self.candidate_active = True
             self.candidate_line = self.best_line.copy()
@@ -422,7 +422,7 @@ class RacingLineManager:
         n_points = len(self.track.s)
         mutation_mask = np.ones(n_points)
         sector_start_idx = np.random.randint(0, n_points)
-        sector_length_idx = int(n_points * 0.3)
+        sector_length_idx = int(n_points * 0.9) # 30% of the track
         
         for i in range(n_points):
             dist = min(abs(i - sector_start_idx), n_points - abs(i - sector_start_idx))
@@ -528,7 +528,7 @@ class VelocityProfileManager:
         return sat(min(learned, safe + self.data_margin), self.vx_min, self.vx_max)
 
     def _apply_braking_zones(self, profile: np.ndarray) -> np.ndarray:
-        """Propagates braking requirements backward so the car slows down BEFORE the turn."""
+        """Propagates braking requirements backward so the car slows down before the turn."""
         safe_decel = 6.0  # m/s^2 (Aggressive but safe braking for F1TENTH)
         n = len(self.track.s)
         
@@ -627,7 +627,7 @@ class IterativeRacingLineMPC(Node):
         self.declare_parameter('track_csv', '/home/giorgos/sim_ws/src/f1tenth_gym_ros/maps/BrandsHatch_centerline.csv')
         self.declare_parameter('namespace', '')
         self.declare_parameter('dt', 0.1)
-        self.declare_parameter('N', 15)
+        self.declare_parameter('N', 30) # 15
 
         # Vehicle Limits & Dynamics
         self.declare_parameter('vx_bounds', [0.8, 8.0])
@@ -672,7 +672,7 @@ class IterativeRacingLineMPC(Node):
 
         # QP & MPC Weights
         self.declare_parameter('mincurv_enable', True)
-        self.declare_parameter('mincurv_w_curv', 100.0)
+        self.declare_parameter('mincurv_w_curv', 100.0) # 100
         self.declare_parameter('mincurv_w_smooth', 2.0)
         self.declare_parameter('mincurv_w_data', 1.0)
         self.declare_parameter('mincurv_w_prev', 0.1)
@@ -689,8 +689,8 @@ class IterativeRacingLineMPC(Node):
         self.declare_parameter('qf_epsi', 18.0)
         self.declare_parameter('qf_s', 0.0)
         self.declare_parameter('qf_ey', 40.0)
-        self.declare_parameter('r_delta', 1.0)
-        self.declare_parameter('r_a', 0.3)
+        self.declare_parameter('r_delta', 1.0) # 1.0
+        self.declare_parameter('r_a', 0.3) # 0.3
         self.declare_parameter('w_slack', 10000.0)
         
         # Velocity Profiling Constants
@@ -962,6 +962,7 @@ class IterativeRacingLineMPC(Node):
 
     # --- Mathematical Core (ATV & OSQP) ---
     def atv_matrices(self, xbar_seq: np.ndarray, ubar_seq: np.ndarray):
+        """Calculates the exact analytical Jacobian matrices for real-time non-linear model linearization."""
         A_list, B_list, C_list = [], [], []
 
         for k in range(self.N):
@@ -1037,6 +1038,7 @@ class IterativeRacingLineMPC(Node):
         return A_list, B_list, C_list
 
     def build_reference_horizon(self, x0: np.ndarray):
+        """Builds the N-step prediction horizon with true heading and dynamic feedforward steering."""
         xref = np.zeros((self.N + 1, 6), dtype=float)
         uref = np.zeros((self.N, 2), dtype=float)
 
@@ -1071,7 +1073,6 @@ class IterativeRacingLineMPC(Node):
             xref[k, 5] = ey_k
 
         for k in range(self.N):
-            # TRUE DYNAMIC CURVATURE FOR STEERING (Point 2)
             kappa_k = self.line_mgr.dynamic_kappa_at(s_ref[k])
             
             delta_ff = self.steer_sign * self.ff_gain * math.atan(self.L_wb * kappa_k)
@@ -1083,6 +1084,7 @@ class IterativeRacingLineMPC(Node):
         return xref, uref
 
     def osqp_mats(self, A_list, B_list, C_list, x0, xref, uref):
+        """Assembles the sparse QP matrices, applying steering-rate penalties and slack variables for stability."""
         n_x, n_u, N = 6, 2, self.N
         n_s = N  
         Xn = (N + 1) * n_x
@@ -1343,6 +1345,7 @@ class IterativeRacingLineMPC(Node):
             self.out_of_track_in_lap += 1
 
     def finalize_lap_if_needed(self, x0: np.ndarray):
+        """Evaluates lap validity upon wrap-around and triggers learning managers if the data is safe."""
         if self.prev_s is None:
             self.prev_s = float(x0[4])
             return
