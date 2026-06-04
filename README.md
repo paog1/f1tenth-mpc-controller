@@ -10,29 +10,28 @@ A core philosophy of this project is the strict adherence to a **purely mathemat
 
 Furthermore, the controller is designed with advanced soft constraints (slack variables) that allow the vehicle to safely touch or graze track boundaries without the solver failing (becoming infeasible), promoting aggressive and continuous learning.
 
-## Repository Structure & Core Components
+## Repository Structure & Development Methodology
 
-To navigate this repository effectively, please focus on the following four critical Python scripts within the `mpc_controller` package. These files constitute the entirety of the project's logic and iterative learning pipeline.
+To navigate this repository effectively, please focus on four critical Python scripts within the `mpc_controller` package. 
 
-### 1. `mpc_controller.py` (The Main Node)
-This is the primary executable file that drives the vehicle. It integrates the learning managers and the real-time MPC loop.
-* **Functionality:** Linearizes the Discrete Kinematic Bicycle Model, assembles the sparse QP matrices (handling `r_delta` and `q_ey` steering weight balancing), and publishes optimal `delta` (steering) and `a` (acceleration) commands at 10Hz.
-* **Significance:** This is the only file required to actively run the autonomous navigation in the simulator.
+The development methodology for this project was highly modular. The three core components (MPC, Racing Line Manager, and Velocity Profile Manager) were first written, isolated, and tuned in their own standalone files to ensure mathematical stability before being integrated into the final master node.
 
-### 2. `MPC.py` (Standalone Controller Validation)
-A standalone script isolated from the iterative learning managers. 
-* **Functionality:** Implements the base MPC logic strictly for trajectory tracking.
-* **Significance:** Used to tune the controller matrices and validate that the underlying mathematical model can follow a static reference line accurately and stably before introducing dynamic path mutations.
+### 1. `mpc_controller.py` (The Final Integrated Node)
+This is the main executable file that combines all three classes and actually drives the vehicle in the simulation. 
+* **Functionality:** It runs the 10Hz real-time control loop, linearizes the Discrete Kinematic Bicycle Model, assembles the sparse QP matrices, and manages the lap-to-lap iterative learning updates. 
+* **Significance:** This file represents the culmination of the entire project.
 
-### 3. `RacingLineManager.py` (Path Optimization)
-The core of the geometric learning engine.
-* **Functionality:** Analyzes telemetry from the previously completed lap and generates the next candidate racing line. It mathematically mutates the line toward the apexes and passes it through a global Minimum Curvature QP solver to ensure physical viability.
-* **Significance:** Proves the iterative nature of the project. It demonstrates how the track path actively improves and smooths out lap-after-lap without relying on AI or predefined track sectors.
+### 2. `MPC.py` (Isolated Tuning Class)
+* **Functionality:** Contains just the base MPC mathematical model.
+* **Significance:** This file was extracted to tune the controller independently. It was used to adjust the weight matrices (Q, R) and slack variables, ensuring the car could stably follow a basic, static reference line before introducing the complexity of the iterative learning algorithms.
 
-### 4. `VelocityProfileManager.py` (Speed Optimization)
-The speed control counterpart to the geometric learner.
-* **Functionality:** Dynamically calculates the maximum safe velocity for every point on the track based on the newly generated candidate line's true geometric curvature. It automatically propagates braking zones backward from sharp turns.
-* **Significance:** Validates the project's progress by demonstrating mathematically sound reductions in lap times as the racing line evolves.
+### 3. `RacingLineManager.py` (Isolated Tuning Class)
+* **Functionality:** Contains the geometric path-learning engine.
+* **Significance:** Isolated to verify that the track-centric ILC approach works. It allowed for the independent testing of line mutations toward the apexes and confirmed that the Minimum Curvature QP smoothing generates physically viable, improved candidate lines lap after lap.
+
+### 4. `VelocityProfileManager.py` (Isolated Tuning Class)
+* **Functionality:** Contains the dynamic speed and braking calculations.
+* **Significance:** Isolated to prove that the dynamic curvature math accurately generates safe, optimized velocity profiles. This component was tested separately to ensure it properly propagates braking zones and pushes the car to faster lap times as the racing line evolves.
 
 ## Author
 **Stasinos Georgios (Στασινός Γεώργιος)** Electrical Engineering / F1TENTH Autonomous Racing Project
