@@ -197,9 +197,14 @@ class FrenetProjector:
         return float(xc + nx * ey), float(yc + ny * ey)
 
 
-class RacingLineManager:
-    """Lap-to-lap racing-line learner using Trust-Region Iterative Optimization (TR-ILC)."""
+# ===============================
+# Iterative Learning Managers
+# ===============================
 
+class RacingLineManager:
+    """Lap-to-lap racing-line learner in Frenet e_y(s) with Dynamic Curvature."""
+
+    # --- Initialization & State Access ---
     def __init__(
         self, track: Track, frenet: FrenetProjector, ey_margin: float, log_dir: str, seed_laps: int,
         exploration_amp: float, exploration_sectors: int, sectors_to_perturb: int, accept_margin_sec: float,
@@ -210,27 +215,28 @@ class RacingLineManager:
         self.frenet = frenet
         self.ey_margin = ey_margin
         self.seed_laps = seed_laps
-        
-        # --- NEW: Trust Region Parameter ---
-        # Re-purposing the old exploration_amp to define the width of the Trust Region tube.
-        # A value of 0.35 means the algorithm can explore up to 0.35m away from the previous lap.
-        self.exploration_tube = max(0.1, exploration_amp / 10.0) if exploration_amp > 1.0 else 0.35 
-        
+        self.exploration_amp = exploration_amp
+        self.exploration_sectors = exploration_sectors
+        self.sectors_to_perturb = sectors_to_perturb
         self.accept_margin_sec = accept_margin_sec
         self.line_blend = line_blend
         self.smooth_window = smooth_window
         self.log_dir = log_dir
 
         self.mincurv_enable = mincurv_enable
+        self.mincurv_w_curv = mincurv_w_curv
+        self.mincurv_w_smooth = mincurv_w_smooth
+        self.mincurv_w_data = mincurv_w_data
+        self.mincurv_w_prev = mincurv_w_prev
+
         self.best_line = np.zeros_like(track.s, dtype=float)
         self.candidate_line = self.best_line.copy()
         self.candidate_active = False
 
         self.best_lap_time = np.inf
         self.best_lap_idx = -1
-        self.patience_counter = 0
-        self.max_patience = 5
         
+        # Initialize dynamic curvature with standard centerline curvature
         self.dynamic_kappa = np.abs(track.kappa.copy())
 
         os.makedirs(self.log_dir, exist_ok=True)
@@ -244,13 +250,15 @@ class RacingLineManager:
         return self.candidate_line if self.candidate_active else self.best_line
         
     def dynamic_kappa_at(self, s_query: float) -> float:
+        """Returns the dynamic curvature of the actively learned path."""
         return float(self.track._interp_pair(self.dynamic_kappa, s_query))
 
     def _update_dynamic_curvature(self):
         """Calculates true geometric curvature of the current racing line."""
         line = self.active_line()
         n = len(self.track.s)
-        X, Y = np.zeros(n), np.zeros(n)
+        X = np.zeros(n)
+        Y = np.zeros(n)
         
         for i, s_val in enumerate(self.track.s):
             X[i], Y[i] = self.frenet.frenet_to_global(float(s_val), float(line[i]))
@@ -261,15 +269,16 @@ class RacingLineManager:
         ds = np.gradient(self.track.s)
         ds[np.abs(ds) < 1e-6] = 1e-6  
         
-        Xp, Yp = np.gradient(X) / ds, np.gradient(Y) / ds
-        Xpp, Ypp = np.gradient(Xp) / ds, np.gradient(Yp) / ds
+        Xp = np.gradient(X) / ds
+        Yp = np.gradient(Y) / ds
+        Xpp = np.gradient(Xp) / ds
+        Ypp = np.gradient(Yp) / ds
         
         denom = Xp**2 + Yp**2
         denom[denom < 1e-6] = 1e-6
         kappa = (Xp * Ypp - Yp * Xpp) / np.power(denom, 1.5)
         
-        # self.dynamic_kappa = circ_moving_average(np.abs(kappa), self.smooth_window)
-        self.dynamic_kappa = circ_moving_average(kappa, self.smooth_window)
+        self.dynamic_kappa = circ_moving_average(np.abs(kappa), self.smooth_window)
 
     def _periodic_diff_matrix(self, n: int, order: int) -> sparse.csc_matrix:
         rows, cols, data = [], [], []
@@ -283,157 +292,165 @@ class RacingLineManager:
                 rows += [i, i, i]
                 cols += [(i - 1) % n, i, (i + 1) % n]
                 data += [1.0, -2.0, 1.0]
+        else:
+            raise ValueError("Only first and second periodic differences are supported.")
         return sparse.csc_matrix((data, (rows, cols)), shape=(n, n))
 
-    def _smooth_driven_telemetry(self, data_line: np.ndarray) -> np.ndarray:
-        """Acts as a low-pass geometric filter for the car's actual driven path."""
-        n = len(self.track.s)
-        if n < 5 or not self.mincurv_enable:
+    def _minimum_curvature_qp(self, data_line: np.ndarray, prev_line: np.ndarray) -> np.ndarray:
+        """Filters the driven line through an OSQP solver to minimize curvature and ensure track-bound compliance."""
+        if not self.mincurv_enable:
             return self._clip_to_walls(circ_moving_average(data_line, self.smooth_window))
 
+        n = len(self.track.s)
+        if n < 5:
+            return self._clip_to_walls(data_line)
+
+        D1 = self._periodic_diff_matrix(n, order=1)
         D2 = self._periodic_diff_matrix(n, order=2)
         I = sparse.eye(n, format='csc')
 
-        # Strong weight on the data, light weight on curvature to just smooth sensor noise
-        P = (10.0 * (D2.T @ D2) + 50.0 * I).tocsc()
+        macro_kappa = circ_moving_average(np.abs(self.track.kappa), int(self.smooth_window * 4))
+        max_k = np.max(macro_kappa) + 1e-6
+        norm_k = macro_kappa / max_k
+        w_data_array = self.mincurv_w_data * (1.0 - norm_k)
+        W_data_mat = sparse.diags(w_data_array, format='csc')
+
+        P = (
+            self.mincurv_w_curv * (D2.T @ D2)
+            + self.mincurv_w_smooth * (D1.T @ D1)
+            + W_data_mat 
+            + self.mincurv_w_prev * I
+        ).tocsc()
         
         clean_kappa = circ_moving_average(self.track.kappa, self.smooth_window)
-        q = (10.0 * (D2.T @ clean_kappa)) - (50.0 * data_line)
+        q_curv = self.mincurv_w_curv * (D2.T @ clean_kappa)
+        q = q_curv - (w_data_array * data_line) - (self.mincurv_w_prev * prev_line)
 
         lo, hi = self._line_bounds()
         prob = osqp.OSQP()
         try:
-            prob.setup(P=P, q=q, A=I, l=lo, u=hi, verbose=False, warm_start=True, eps_abs=1e-3, eps_rel=1e-3, max_iter=5000)
+            prob.setup(P=P, q=q, A=I, l=lo, u=hi, verbose=False, warm_start=True,
+                       eps_abs=1e-4, eps_rel=1e-4, max_iter=10000, polish=True)
             res = prob.solve()
             if res.info.status_val in (1, 2):
-                return circ_moving_average(np.asarray(res.x, dtype=float), self.smooth_window)
+                out = np.asarray(res.x, dtype=float)
+                out = circ_moving_average(out, int(self.smooth_window * 1.5))
+            else:
+                out = circ_moving_average(data_line, self.smooth_window)
         except Exception:
-            pass
-        return self._clip_to_walls(circ_moving_average(data_line, self.smooth_window))
+            out = circ_moving_average(data_line, self.smooth_window)
 
+        return self._clip_to_walls(out)
+    
+    # --- Lap Processing & Next Iteration Preparation ---
     def _executed_line_from_lap(self, X: np.ndarray) -> np.ndarray:
         line = self.active_line().copy()
         if X.shape[0] < 10:
             return line
 
-        bins, cnts = np.zeros_like(self.track.s, dtype=float), np.zeros_like(self.track.s, dtype=float)
+        bins = np.zeros_like(self.track.s, dtype=float)
+        cnts = np.zeros_like(self.track.s, dtype=float)
+
         ds_nom = float(np.median(np.diff(self.track.s))) if len(self.track.s) > 2 else 0.1
-        max_accept_dist = max(0.15, 4.0 * ds_nom)
+        max_accept_dist = max(0.25, 4.0 * ds_nom)
 
         for row in X:
             s_val = float(row[4] % self.track.L)
+            ey_val = float(row[5])
             idx = int(np.argmin(np.abs(self.track.s - s_val)))
             if abs(float(self.track.s[idx]) - s_val) <= max_accept_dist:
-                bins[idx] += float(row[5])
+                bins[idx] += ey_val
                 cnts[idx] += 1.0
 
         mask = cnts > 0.0
         if np.any(mask):
             line[mask] = bins[mask] / cnts[mask]
 
-        return self._smooth_driven_telemetry(line)
+        line = circ_moving_average(line, self.smooth_window)
+        line = self._clip_to_walls(line)
+        return line
 
     def finish_lap(self, lap_idx: int, stored_laps: int, lap_time: float, valid_lap: bool, X_lap: np.ndarray) -> Tuple[bool, float]:
         accepted = False
-        
-        if valid_lap:
-            executed_line = self._executed_line_from_lap(X_lap)
-            blended_baseline = self.line_blend * executed_line + (1.0 - self.line_blend) * self.active_line()
+        executed_line = self._executed_line_from_lap(X_lap)
+        prev_best = self.best_line.copy()
 
-            if not np.isfinite(self.best_lap_time) or (stored_laps <= self.seed_laps):
-                self.best_line = blended_baseline
+        if valid_lap:
+            data_target = self.line_blend * executed_line + (1.0 - self.line_blend) * self.active_line()
+            learned_line = self._minimum_curvature_qp(data_target, prev_best)
+
+            if not np.isfinite(self.best_lap_time):
+                self.best_line = learned_line
                 self.best_lap_time = lap_time
                 self.best_lap_idx = lap_idx
                 accepted = True
-                self.candidate_active = False
-                self.patience_counter = 0
+            elif stored_laps <= self.seed_laps:
+                if lap_time < self.best_lap_time:
+                    self.best_line = learned_line
+                    self.best_lap_time = lap_time
+                    self.best_lap_idx = lap_idx
+                    accepted = True
             else:
                 if lap_time <= (self.best_lap_time + self.accept_margin_sec):
-                    self.best_line = blended_baseline
+                    self.best_line = learned_line
                     if lap_time < self.best_lap_time:
                         self.best_lap_time = lap_time
                         self.best_lap_idx = lap_idx
                     accepted = True
-                    self.candidate_active = False
-                    self.patience_counter = 0
-                else:
-                    # --- NEW: The Trial Period ---
-                    # Valid lap, but slower. Keep candidate active so velocity can learn.
-                    self.patience_counter += 1
-                    if self.patience_counter >= self.max_patience:
-                        print(f"[TR-ILC] Candidate failed to break record after {self.max_patience} laps. Shrinking Trust Region.")
-                        self.candidate_active = False
-                        self.patience_counter = 0
-                        # Shrink the trust region by 25% to force the QP to find a different solution next lap
-                        self.exploration_tube *= 0.75 
-                    else:
-                        print(f"[TR-ILC] Waiting for velocity (Lap {self.patience_counter}/{self.max_patience}). Time: {lap_time:.2f}s (Best: {self.best_lap_time:.2f}s)")
-                        # By NOT setting candidate_active = False, we lock the candidate in for the next lap.
-        else:
-            print("[TR-ILC] Invalid lap (crashed/off-track). Abandoning candidate.")
-            self.candidate_active = False
-            self.patience_counter = 0
-            self.exploration_tube *= 0.75
 
-        # Only revert to baseline if the candidate was definitively accepted or abandoned
-        if not self.candidate_active:
-            self.candidate_line = self.best_line.copy()
-            
+        self.candidate_active = False
+        self.candidate_line = self.best_line.copy()
+        
         self._update_dynamic_curvature()
         self._save_line_csv(os.path.join(self.log_dir, f"best_line_after_lap_{lap_idx:03d}.csv"), self.best_line)
         return accepted, float(self.best_lap_time)
 
     def prepare_next_candidate(self, stored_laps: int):
-        """Generates the next optimal racing line using Trust-Region Iterative Optimization."""
+        """Mutates the racing line towards the apexes using dynamic curvature and passes it through the QP for safety."""
         if stored_laps < max(2, self.seed_laps):
             self.candidate_active = True
             self.candidate_line = self.best_line.copy()
             self._update_dynamic_curvature()
             return
 
-        if self.candidate_active:
-            return
+        base = self.best_line.copy()
+        current_amp = self.exploration_amp
 
-        n = len(self.track.s)
-        ds = float(np.median(np.diff(self.track.s)))
-        if ds < 1e-3: ds = 0.1
+        signed_dyn_kappa = self.dynamic_kappa * np.sign(self.track.kappa)
+        physical_k_limit = 0.6
+        normalized_kappa = np.clip(signed_dyn_kappa / physical_k_limit, -1.0, 1.0)
 
-        # --- THE PURE PHYSICS OBJECTIVE ---
-        # D2 matrix acts as the steel beam, trying to pull the line perfectly straight
-        D2 = self._periodic_diff_matrix(n, order=2) / (ds ** 2)
-        P = (D2.T @ D2).tocsc()
-        q = D2.T @ self.track.kappa
-        I = sparse.eye(n, format='csc')
+        n_points = len(self.track.s)
+        mutation_mask = np.ones(n_points)
+        sector_start_idx = np.random.randint(0, n_points)
+        sector_length_idx = int(n_points * 0.9) # 30% of the track
+        
+        for i in range(n_points):
+            dist = min(abs(i - sector_start_idx), n_points - abs(i - sector_start_idx))
+            if dist > sector_length_idx / 2:
+                mutation_mask[i] = 0.0
+        
+        mutation_mask = circ_moving_average(mutation_mask, int(self.smooth_window * 2))
+        apex_pull = current_amp * (normalized_kappa ** 3)
 
-        # --- THE TRUST REGION CONSTRAINTS ---
-        lo, hi = np.zeros(n), np.zeros(n)
-        for i, s in enumerate(self.track.s):
-            wl, wr = self.track.widths_at(float(s), margin=self.ey_margin)
-            
-            # The algorithm is only allowed to explore a narrow tube around the previous best lap
-            trust_lo = self.best_line[i] - self.exploration_tube
-            trust_hi = self.best_line[i] + self.exploration_tube
-            
-            lo[i] = max(-wr, trust_lo)
-            hi[i] = min(wl, trust_hi)
+        ds_nom = float(np.median(np.diff(self.track.s))) if len(self.track.s) > 2 else 0.1
+        shift_idx = int(5.0 / ds_nom) 
 
-        prob = osqp.OSQP()
-        try:
-            prob.setup(P=P, q=q, A=I, l=lo, u=hi, verbose=False, warm_start=True, eps_abs=1e-4, eps_rel=1e-4, max_iter=20000)
-            res = prob.solve()
-            if res.info.status_val in (1, 2):
-                cand = np.asarray(res.x, dtype=float)
-            else:
-                cand = self.best_line.copy()
-        except Exception:
-            cand = self.best_line.copy()
+        entry_push = -0.6 * np.roll(apex_pull, -shift_idx)
+        exit_push  = -0.6 * np.roll(apex_pull, shift_idx)
+
+        raw_shift = (apex_pull + entry_push + exit_push) * mutation_mask
+        shift = circ_moving_average(raw_shift, int(self.smooth_window * 2))
+        cand = base + shift
+
+        cand = self._minimum_curvature_qp(cand, base)
         
         self.candidate_line = cand
         self.candidate_active = True
         self._update_dynamic_curvature() 
         
         self._save_line_csv(os.path.join(self.log_dir, f"candidate_line_lap_{stored_laps:03d}.csv"), cand)
-        print(f"Generated TR-ILC candidate line for lap {stored_laps} with {self.exploration_tube:.2f}m Trust Region.")
+        print(f"Generated Iterative candidate line for lap {stored_laps} with amp {current_amp:.2f} at sector {sector_start_idx}")
 
     # --- Boundaries & I/O Utilities ---
     def _line_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -466,15 +483,14 @@ class RacingLineManager:
 
 
 class VelocityProfileManager:
-    """Velocity learning based on the Dynamic Curvature of the learned path.
-       Updated with Asymmetric Monotonic Update Law for stable convergence."""
+    """Velocity learning based on the Dynamic Curvature of the learned path."""
 
     # --- Initialization & State Access ---
     def __init__(
         self, track: Track, line_mgr: RacingLineManager, log_dir: str, vx_min: float, vx_max: float,
         a_lat_ref_max: float, curv_speed_floor: float, speed_ref_scale: float, enable: bool = True,
-        blend: float = 0.80, smooth_window: int = 21, accept_margin_sec: float = 2.5,
-        data_margin: float = 0.5, max_speed_step: float = 1.0,
+        blend: float = 0.35, smooth_window: int = 21, accept_margin_sec: float = 0.20,
+        data_margin: float = 0.15, max_speed_step: float = 0.25,
     ):
         self.track = track
         self.line_mgr = line_mgr
@@ -500,8 +516,7 @@ class VelocityProfileManager:
         self._save_speed_csv(os.path.join(self.log_dir, "speed_profile_init.csv"), self.learned_speed)
 
     def curvature_speed_at(self, s_val: float) -> float:
-        # kappa = self.line_mgr.dynamic_kappa_at(s_val)
-        kappa = abs(self.line_mgr.dynamic_kappa_at(s_val))
+        kappa = self.line_mgr.dynamic_kappa_at(s_val)
         kappa = max(kappa, self.curv_speed_floor)
         vref = self.speed_ref_scale * math.sqrt(max(0.1, self.a_lat_ref_max / kappa))
         return sat(vref, self.vx_min, self.vx_max)
@@ -515,8 +530,7 @@ class VelocityProfileManager:
 
     def _apply_braking_zones(self, profile: np.ndarray) -> np.ndarray:
         """Propagates braking requirements backward so the car slows down before the turn."""
-        # safe_decel = 5.5  # Matched exactly to your MPC a_bounds minimum
-        safe_decel = 7.5  # Matched exactly to your MPC a_bounds minimum
+        safe_decel = 6.0  # m/s^2 (Aggressive but safe braking for F1TENTH)
         n = len(self.track.s)
         
         # Double pass handles the start/finish line wrap-around
@@ -553,6 +567,9 @@ class VelocityProfileManager:
         if np.any(mask):
             profile[mask] = sums[mask] / counts[mask]
 
+        profile = circ_moving_average(profile, self.smooth_window)
+        for i, s in enumerate(self.track.s):
+            profile[i] = sat(min(profile[i], self.curvature_speed_at(float(s)) + self.data_margin), self.vx_min, self.vx_max)
         return profile, counts
 
     def update_from_lap(self, lap_idx: int, lap_time: float, valid_lap: bool, X_lap: np.ndarray) -> bool:
@@ -566,29 +583,24 @@ class VelocityProfileManager:
         if np.count_nonzero(counts) < max(5, int(0.15 * len(self.track.s))):
             return False
 
-        # --- THE ASYMMETRIC MONOTONIC UPDATE LAW ---
-        raw_error = measured - self.learned_speed
-        smoothed_error = circ_moving_average(raw_error, self.smooth_window)
-        
-        step = self.blend * smoothed_error
-        step = np.clip(step, -self.max_speed_step, self.max_speed_step)
-        
-        proposed_speed = self.learned_speed + step
+        target = measured
+        raw_update = (1.0 - self.blend) * self.learned_speed + self.blend * target
+
+        delta = np.clip(raw_update - self.learned_speed, -self.max_speed_step, self.max_speed_step)
+        self.learned_speed = self.learned_speed + delta
+        self.learned_speed = circ_moving_average(self.learned_speed, self.smooth_window)
 
         for i, s in enumerate(self.track.s):
-            safe_limit = self.curvature_speed_at(float(s)) + self.data_margin
             self.learned_speed[i] = sat(
-                proposed_speed[i], 
-                self.learned_speed[i], # The MAX constraint: never go slower than previously proven safe
-                safe_limit             # The MIN constraint: never exceed the dynamic friction circle
+                min(self.learned_speed[i], self.curvature_speed_at(float(s)) + self.data_margin),
+                self.vx_min,
+                self.vx_max,
             )
-            self.learned_speed[i] = sat(self.learned_speed[i], self.vx_min, self.vx_max)
 
         self.learned_speed = self._apply_braking_zones(self.learned_speed)
 
         if lap_time < self.best_lap_time:
             self.best_lap_time = lap_time
-            
         self.num_updates += 1
         self._save_speed_csv(os.path.join(self.log_dir, f"speed_profile_after_lap_{lap_idx:03d}.csv"), self.learned_speed)
         return True
@@ -616,27 +628,27 @@ class IterativeRacingLineMPC(Node):
         self.declare_parameter('track_csv', '/home/giorgos/sim_ws/src/f1tenth_gym_ros/maps/BrandsHatch_centerline.csv')
         self.declare_parameter('namespace', '')
         self.declare_parameter('dt', 0.1)
-        self.declare_parameter('N', 15) # 15
+        self.declare_parameter('N', 30) # 15
 
         # Vehicle Limits & Dynamics
         self.declare_parameter('vx_bounds', [0.8, 8.0])
         self.declare_parameter('vy_abs_max', 4.0)
-        self.declare_parameter('wz_abs_max', 15.0) # 6 # 15
+        self.declare_parameter('wz_abs_max', 15.0) # 6 
         self.declare_parameter('e_psi_abs_max', 1.5)
         self.declare_parameter('e_y_abs_max', 1.5)
         self.declare_parameter('delta_bounds', [-0.35, 0.35])
         self.declare_parameter('a_bounds', [-5.5, 3.5])
         self.declare_parameter('delta_rate_max', 5.0) # 2
         self.declare_parameter('a_rate_max', 3.5)
-        self.declare_parameter('rho_du', 2.5) # 0.35
+        self.declare_parameter('rho_du', 0.35)
         self.declare_parameter('wheelbase', 0.33)
         self.declare_parameter('steer_sign', 1.0)
         self.declare_parameter('ff_gain', 1.0)
 
         # Seeding Settings
         self.declare_parameter('do_seed_laps', True)
-        self.declare_parameter('seed_laps', 2)
-        self.declare_parameter('seed_speed', 3.0)
+        self.declare_parameter('seed_laps', 1)
+        self.declare_parameter('seed_speed', 4.0)
         self.declare_parameter('seed_hug_speed', 1.8)
         self.declare_parameter('seed_wall_margin', 0.35)
         self.declare_parameter('seed_wall_alpha', 0.45)
@@ -655,7 +667,7 @@ class IterativeRacingLineMPC(Node):
         self.declare_parameter('exploration_amp', 2.5)
         self.declare_parameter('exploration_sectors', 8)
         self.declare_parameter('sectors_to_perturb', 10)  
-        self.declare_parameter('accept_margin_sec', 0.0) # 2.5
+        self.declare_parameter('accept_margin_sec', 2.5)
         self.declare_parameter('line_blend', 0.2)
         self.declare_parameter('line_smooth_window', 11)
 
@@ -669,29 +681,29 @@ class IterativeRacingLineMPC(Node):
         self.declare_parameter('q_vx', 2.0)
         self.declare_parameter('q_vy', 0.2)
         self.declare_parameter('q_wz', 0.2)
-        self.declare_parameter('q_epsi', 2.0) # 12 # 18
+        self.declare_parameter('q_epsi', 12.0)
         self.declare_parameter('q_s', 0.0)
-        self.declare_parameter('q_ey', 40.0) # 10 # 15
+        self.declare_parameter('q_ey', 10.0)
         self.declare_parameter('qf_vx', 4.0)
         self.declare_parameter('qf_vy', 0.5)
         self.declare_parameter('qf_wz', 0.5)
-        self.declare_parameter('qf_epsi', 2.0) # 18 # 25
+        self.declare_parameter('qf_epsi', 18.0)
         self.declare_parameter('qf_s', 0.0)
         self.declare_parameter('qf_ey', 40.0)
-        self.declare_parameter('r_delta', 0.5) # 1.0
+        self.declare_parameter('r_delta', 1.0) # 1.0
         self.declare_parameter('r_a', 0.3) # 0.3
         self.declare_parameter('w_slack', 10000.0)
         
         # Velocity Profiling Constants
-        self.declare_parameter('a_lat_ref_max', 4.5) # 3.5
+        self.declare_parameter('a_lat_ref_max', 3.5)
         self.declare_parameter('curv_speed_floor', 0.03)
-        self.declare_parameter('speed_ref_scale', 0.99) 
+        self.declare_parameter('speed_ref_scale', 0.95) 
         self.declare_parameter('velocity_learning_enable', True)
-        self.declare_parameter('velocity_blend', 0.8)
+        self.declare_parameter('velocity_blend', 0.5)
         self.declare_parameter('velocity_smooth_window', 21)
-        self.declare_parameter('velocity_accept_margin_sec', 100.0)
+        self.declare_parameter('velocity_accept_margin_sec', 2.5)
         self.declare_parameter('velocity_data_margin', 0.5)
-        self.declare_parameter('velocity_max_step', 2.0) # 1.0
+        self.declare_parameter('velocity_max_step', 0.25)
 
         # Logging & Vis
         self.declare_parameter('log_dir', '/home/giorgos/sim_ws/src/mpc_controller/logs')
@@ -1045,7 +1057,7 @@ class IterativeRacingLineMPC(Node):
             ey_k = self.line_mgr.line_at(s_k)
 
             # TRUE HEADING CALCULATION (Point 1)
-            ds_diff = 0.2 # 1.5
+            ds_diff = 1.5
             ey_fw = self.line_mgr.line_at(s_k + ds_diff)
             ey_bw = self.line_mgr.line_at(s_k - ds_diff)
             deyds = (ey_fw - ey_bw) / (2.0 * ds_diff)
@@ -1062,7 +1074,6 @@ class IterativeRacingLineMPC(Node):
             xref[k, 5] = ey_k
 
         for k in range(self.N):
-            # kappa_k = self.line_mgr.dynamic_kappa_at(s_ref[k])
             kappa_k = self.line_mgr.dynamic_kappa_at(s_ref[k])
             
             delta_ff = self.steer_sign * self.ff_gain * math.atan(self.L_wb * kappa_k)
@@ -1248,7 +1259,7 @@ class IterativeRacingLineMPC(Node):
             a = (seed_v - self.speed_cmd) / self.dt
             a = sat(a, self.a_min, self.a_max)
 
-            self.apply_control(x0[0], delta, a)
+            self.apply_control(delta, a)
             self.append_traj(x0, np.array([delta, a], dtype=float))
 
             xbar = np.tile(x0, (self.N + 1, 1))
@@ -1292,15 +1303,14 @@ class IterativeRacingLineMPC(Node):
             a = float(sat(Uopt[0, 1], self.a_min, self.a_max))
             use_x_seq = Xopt
 
-        self.apply_control(x0[0], delta, a)
+        self.apply_control(delta, a)
         self.append_traj(x0, np.array([delta, a], dtype=float))
         self.publish_preview(use_x_seq)
 
         self.prev_s = float(x0[4])
 
-    def apply_control(self, current_vx: float, delta: float, a: float):
-        # FIX: Tie the command to the actual physical state to prevent runaway integration
-        self.speed_cmd = current_vx + (a * self.dt)
+    def apply_control(self, delta: float, a: float):
+        self.speed_cmd += a * self.dt
         self.speed_cmd = sat(self.speed_cmd, self.vx_min, self.vx_max)
 
         msg = AckermannDriveStamped()
