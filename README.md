@@ -18,7 +18,7 @@ The development methodology for this project was highly modular. The three core 
 
 ### 1. `mpc_controller.py` (The Final Integrated Node)
 This is the main executable file that combines all three classes and actually drives the vehicle in the simulation. 
-* **Functionality:** It runs the 10Hz real-time control loop, linearizes the Discrete Kinematic Bicycle Model, assembles the sparse QP matrices, and manages the lap-to-lap iterative learning updates. 
+* **Functionality:** It runs the 30Hz real-time control loop, linearizes the Discrete Kinematic Bicycle Model, assembles the sparse QP matrices, and manages the lap-to-lap iterative learning updates. 
 * **Significance:** This file represents the culmination of the entire project.
 
 ### 2. `MPC.py` (Isolated Tuning Class)
@@ -34,4 +34,4 @@ This is the main executable file that combines all three classes and actually dr
 * **Significance:** Isolated to prove that the dynamic curvature math accurately generates safe, optimized velocity profiles. This component was tested separately to ensure it properly propagates braking zones and pushes the car to faster lap times as the racing line evolves.
 
 ## Author
-**Stasinos Georgios (Στασινός Γεώργιος)** Electrical Engineering / F1TENTH Autonomous Racing Project
+**Stasinos Georgios** Electrical Engineering / F1TENTH Autonomous Racing Project
